@@ -22,6 +22,7 @@ on:
     branches:
       - main
     tags:
+      - "quality-guard-v*"
       - "v*"
     paths:
       - "sidecar/quality_guard.py"
@@ -106,7 +107,9 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
+            # v1.2.3 and quality-guard-v1.2.3 both publish :1.2.3
+            type=match,pattern=v(.*),group=1
+            type=match,pattern=quality-guard-v(.*),group=1
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
