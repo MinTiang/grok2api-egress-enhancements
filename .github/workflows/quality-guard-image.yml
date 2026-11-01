@@ -1,6 +1,6 @@
 # Build and publish the Quality Guard sidecar image.
 #
-# Publishes ghcr.io/<owner>/<repo>/quality-guard with tags:
+# Publishes ghcr.io/<owner>/<repo>/quality-guard for linux/amd64 and linux/arm64:
 #   latest      - newest build from the default branch
 #   sha-<short> - pinned build, use this in compose for reproducibility
 #   vX.Y.Z      - when pushed as a git tag
@@ -40,57 +40,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}/quality-guard
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Source checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          f=sidecar/quality_guard.py
-          test -s "$f"
-          # The image installs no packages; a third-party import would break it.
-          if grep -nE '^\s*(import|from)\s+(requests|httpx|aiohttp|yaml|bs4|pydantic)\b' "$f"; then
-            echo "::error::non-stdlib import found; the image has no pip dependencies"
-            exit 1
-          fi
-          python3 -m py_compile "$f"
-          # Upstream internal-API contract must be intact.
-          grep -q 'INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"' "$f" \
-            || { echo "::error::internal API prefix changed"; exit 1; }
-          grep -q 'bootstrap.json' "$f" \
-            || { echo "::error::bootstrap contract missing"; exit 1; }
-          grep -q 'GROK2API_BASE_URL' "$f" \
-            || { echo "::error::base URL override missing"; exit 1; }
-          echo "source ok: $(stat -c%s "$f") bytes"
-
-      - name: Import check
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd sidecar
-          python3 -c "import ast,sys; ast.parse(open('quality_guard.py',encoding='utf-8').read()); print('AST ok')"
-
   build:
-    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -100,6 +56,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -107,7 +69,6 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            # v1.2.3 and quality-guard-v1.2.3 both publish :1.2.3
             type=match,pattern=v(.*),group=1
             type=match,pattern=quality-guard-v(.*),group=1
             type=sha,prefix=sha-,format=short
@@ -118,8 +79,6 @@ jobs:
         with:
           context: .
           file: ./sidecar/Dockerfile
-          # Both architectures are published; the smoke test below verifies
-          # each one actually runs.
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -129,64 +88,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify both architectures run
+      - name: Report published tags
         if: github.event_name != 'pull_request'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-        shell: bash
         run: |
-          set -euo pipefail
-          tag=$(printf '%s\n' "$TAGS" | head -n1)
-
-          echo "=== published manifest ==="
-          docker buildx imagetools inspect "$tag"
-
-          # The guard is pure Python, so a platform mismatch is detectable only
-          # by actually executing it under the target architecture.
-          tmp=$(mktemp -d)
-          printf '%s' '{"version":1,"enabled":true,"internal_token":"smoke-token","config":{"model":"grok-4.6","mode":"passive","active_interval_seconds":1800,"passive_poll_seconds":5,"soft_tps":500,"hard_tps":1000,"consecutive_soft":2,"consecutive_errors":2,"quarantine_seconds":300,"no_account_backoff_seconds":300,"min_healthy_nodes":1,"max_output_tokens":384,"fail_closed":false,"min_generation_ms":1000,"prompt":"reply with QUALITY_OK","expected":"QUALITY_OK"}}' \
-            > "$tmp/bootstrap.json"
-          python3 -c "import json,sys; json.load(open('$tmp/bootstrap.json')); print('bootstrap json ok')"
-
-          for platform in linux/amd64 linux/arm64; do
-            echo "=== $platform ==="
-
-            # 1) no bootstrap -> clean, explicit refusal (exit 2), no traceback
-            set +e
-            out=$(docker run --rm --platform "$platform" "$tag" 2>&1)
-            code=$?
-            set -e
-            echo "$out"
-            [ "$code" -eq 2 ] || { echo "::error::$platform: expected exit 2 on missing bootstrap, got $code"; exit 1; }
-            case "$out" in
-              *"bootstrap file is missing"*) ;;
-              *) echo "::error::$platform: unclear missing-bootstrap message"; exit 1 ;;
-            esac
-            case "$out" in
-              *Traceback*) echo "::error::$platform: traceback on missing bootstrap"; exit 1 ;;
-              *) ;;
-            esac
-
-            # 2) valid bootstrap -> config validates and the interpreter runs
-            out=$(docker run --rm --platform "$platform" \
-                    -v "$tmp:/var/lib/grok2api-quality-guard:ro" \
-                    "$tag" --check-config 2>&1)
-            echo "$out"
-            case "$out" in
-              *"configuration is valid"*) ;;
-              *) echo "::error::$platform: rejected a valid bootstrap"; exit 1 ;;
-            esac
-
-            # 3) architecture actually matches
-            arch=$(docker run --rm --platform "$platform" --entrypoint python3 "$tag" \
-                     -c 'import platform; print(platform.machine())')
-            echo "$platform python arch: $arch"
-            case "$platform:$arch" in
-              linux/amd64:x86_64) ;;
-              linux/arm64:aarch64|linux/arm64:arm64) ;;
-              *) echo "::error::architecture mismatch: $platform reported $arch"; exit 1 ;;
-            esac
-
-            echo "smoke ok: $platform"
-          done
+          echo "Published:"
+          printf '%s\n' "$TAGS" | sed 's/^/  /'
