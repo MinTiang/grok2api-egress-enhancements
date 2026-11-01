@@ -5,13 +5,15 @@
 #   sha-<short> - pinned build, use this in compose for reproducibility
 #   vX.Y.Z      - when pushed as a git tag
 #
-# Compose usage (one image reference is all that is needed):
-#   quality-guard:
+# The image is a drop-in for the official tools/egress-quality-guard build, so
+# compose only needs an image reference:
+#
+#   egress-quality-guard:
 #     image: ghcr.io/<owner>/<repo>/quality-guard:latest
 #     environment:
 #       GROK2API_BASE_URL: http://grok2api:8000
-#       GROK2API_ADMIN_USERNAME: admin
-#       GROK2API_ADMIN_PASSWORD_FILE: /run/secrets/admin-password
+#     volumes:
+#       - quality_guard_state:/var/lib/grok2api-quality-guard
 
 name: quality-guard image
 
@@ -58,33 +60,21 @@ jobs:
             exit 1
           fi
           python3 -m py_compile "$f"
-          # Official-form wiring must be present.
-          grep -q '/api/admin/v1/auth/login' "$f" || { echo "::error::missing admin login route"; exit 1; }
-          grep -q '/api/admin/v1/egress-quality-guard' "$f" || { echo "::error::missing admin guard prefix"; exit 1; }
-          if grep -q 'INTERNAL_API_PREFIX' "$f"; then
-            echo "::error::internal API prefix still referenced"
-            exit 1
-          fi
+          # Upstream internal-API contract must be intact.
+          grep -q 'INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"' "$f" \
+            || { echo "::error::internal API prefix changed"; exit 1; }
+          grep -q 'bootstrap.json' "$f" \
+            || { echo "::error::bootstrap contract missing"; exit 1; }
+          grep -q 'GROK2API_BASE_URL' "$f" \
+            || { echo "::error::base URL override missing"; exit 1; }
           echo "source ok: $(stat -c%s "$f") bytes"
 
-      - name: Config smoke (env source)
+      - name: Import check
         shell: bash
         run: |
           set -euo pipefail
-          f=sidecar/quality_guard.py
-          # No credentials -> must be a clean config error, not a traceback.
-          if GROK2API_ADMIN_PASSWORD= python3 "$f" --check-config --config-source env; then
-            echo "::error::guard accepted missing credentials"
-            exit 1
-          fi
-          # With credentials -> must validate.
-          out=$(GROK2API_ADMIN_USERNAME=admin GROK2API_ADMIN_PASSWORD=test \
-                python3 "$f" --check-config --config-source env)
-          echo "$out"
-          case "$out" in
-            *"configuration is valid"*) ;;
-            *) echo "::error::env config did not validate"; exit 1 ;;
-          esac
+          cd sidecar
+          python3 -c "import ast,sys; ast.parse(open('quality_guard.py',encoding='utf-8').read()); print('AST ok')"
 
   build:
     needs: verify
@@ -144,18 +134,48 @@ jobs:
           img=$(printf '%s\n' "$TAGS" | head -n1)
           echo "testing $img"
           docker pull "$img"
-          # Missing credentials must fail loudly, not hang.
-          if docker run --rm "$img" --check-config; then
-            echo "::error::image accepted missing credentials"
-            exit 1
-          fi
-          # Credentials present -> configuration validates.
-          out=$(docker run --rm \
-                  -e GROK2API_ADMIN_USERNAME=admin \
-                  -e GROK2API_ADMIN_PASSWORD=test \
-                  "$img" --check-config)
+
+          # No bootstrap.json (the realistic "grok2api not ready yet" case):
+          # the guard must exit with a clear message, not crash or hang.
+          out=$(docker run --rm "$img" 2>&1 || true)
           echo "$out"
           case "$out" in
-            *"configuration is valid"*) echo "smoke ok" ;;
-            *) echo "::error::image failed config validation"; exit 1 ;;
+            *"bootstrap"*) echo "smoke ok: missing bootstrap reported cleanly" ;;
+            *) echo "::error::unexpected startup output"; exit 1 ;;
+          esac
+
+          # A synthetic bootstrap must be accepted and produce a valid config.
+          tmp=$(mktemp -d)
+          cat > "$tmp/bootstrap.json" <<'JSON'
+          {
+            "version": 1,
+            "enabled": true,
+            "internal_token": "smoke-token",
+            "config": {
+              "model": "grok-4.6",
+              "mode": "passive",
+              "active_interval_seconds": 1800,
+              "passive_poll_seconds": 5,
+              "soft_tps": 500,
+              "hard_tps": 1000,
+              "consecutive_soft": 2,
+              "consecutive_errors": 2,
+              "quarantine_seconds": 300,
+              "no_account_backoff_seconds": 300,
+              "min_healthy_nodes": 1,
+              "max_output_tokens": 384,
+              "fail_closed": false,
+              "min_generation_ms": 1000,
+              "prompt": "reply with QUALITY_OK",
+              "expected": "QUALITY_OK"
+            }
+          }
+          JSON
+          out=$(docker run --rm \
+                  -v "$tmp:/var/lib/grok2api-quality-guard:ro" \
+                  "$img" --check-config 2>&1 || true)
+          echo "$out"
+          case "$out" in
+            *"configuration is valid"*) echo "smoke ok: bootstrap accepted" ;;
+            *) echo "::error::image rejected a valid bootstrap"; exit 1 ;;
           esac

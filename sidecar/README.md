@@ -1,23 +1,29 @@
 # Quality Guard sidecar
 
-Standalone sidecar that backs the Grok2API admin page `/quality-guard`.
+Drop-in image for the official grok2api quality guard, published to GHCR so a
+compose file only needs an `image:` reference instead of building next to an
+upstream checkout.
 
-It talks to the **official admin API** — nothing else:
+## Same contract as upstream
 
-| | route |
+The runtime contract is unchanged from
+`chenyme/grok2api:tools/egress-quality-guard`:
+
+| aspect | behaviour |
 |---|---|
-| login | `POST /api/admin/v1/auth/login` |
-| nodes / probes / audits | `/api/admin/v1/egress-quality-guard/*` |
+| config source | `/var/lib/grok2api-quality-guard/bootstrap.json`, written by grok2api |
+| auth | scoped internal token from that file |
+| API | `/api/internal/v1/quality-guard/*` |
+| environment | `GROK2API_BASE_URL` only |
 
-Because it authenticates with ordinary admin credentials there is **no
-bootstrap.json to wait for and no internal token to provision**. A compose file
-only needs an `image:` reference plus credentials.
+There are no extra credentials to supply: the shared `quality_guard_state`
+volume carries the bootstrap file and the token.
 
 ## Files
 
 | file | role |
 |------|------|
-| `quality_guard.py` | sidecar process (stdlib only, no host URLs or secrets baked in) |
+| `quality_guard.py` | sidecar process (stdlib only) |
 | `Dockerfile` | standalone image, published to GHCR |
 | `QUALITY_GUARD.md` | operator / agent reference (desensitized) |
 
@@ -29,139 +35,94 @@ Built by `.github/workflows/quality-guard-image.yml` on every change to
 ```text
 ghcr.io/<owner>/<repo>/quality-guard:latest
 ghcr.io/<owner>/<repo>/quality-guard:sha-<short>
+ghcr.io/<owner>/<repo>/quality-guard:vX.Y.Z
 ```
 
 Multi-arch (`linux/amd64`, `linux/arm64`). Standard library only, so the image
-carries no pip dependencies and starts in well under a second.
+carries no pip dependencies and starts instantly.
 
-## Compose wiring
+## Compose
 
-Add this next to the existing `grok2api` service. The guard shares the
-`grok2api` network so it can resolve the service name:
+Identical to the upstream service block, with `build:` replaced by `image:`:
 
 ```yaml
 services:
   grok2api:
     image: ghcr.io/chenyme/grok2api:latest
-    # ... your existing config ...
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
+    environment:
+      GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
+    volumes:
+      - quality_guard_state:/var/lib/grok2api-quality-guard
 
-  quality-guard:
+  egress-quality-guard:
+    container_name: grok2api-egress-quality-guard
     image: ghcr.io/<owner>/<repo>/quality-guard:latest
-    container_name: grok2api-quality-guard
+    profiles: ["quality-guard"]
+    environment:
+      GROK2API_BASE_URL: ${GROK2API_BASE_URL:-http://grok2api:8000}
     depends_on:
       grok2api:
-        condition: service_started
-    environment:
-      GROK2API_BASE_URL: http://grok2api:8000
-      GROK2API_ADMIN_USERNAME: ${GROK2API_ADMIN_USERNAME:-admin}
-      GROK2API_ADMIN_PASSWORD: ${GROK2API_ADMIN_PASSWORD}
-      QUALITY_GUARD_MODE: hybrid
-      QUALITY_GUARD_SOFT_TPS: "500"
-      QUALITY_GUARD_HARD_TPS: "1000"
-    restart: unless-stopped
+        condition: service_healthy
+    volumes:
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: "on-failure:5"
     init: true
     stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
-    # Resource ceiling so a probe burst cannot starve grok2api (see notes).
-    mem_limit: 256m
-    cpus: 0.5
-    pids_limit: 128
+
+volumes:
+  quality_guard_state:
 ```
 
-No volume is required. The guard keeps an optional state cache; point
-`QUALITY_GUARD_STATE_DIR` at a writable path if you want it to survive restarts:
-
-```yaml
-    volumes:
-      - quality_guard_state:/var/lib/grok2api-quality-guard
-```
-
-Prefer a secret file over an inline password:
-
-```yaml
-    environment:
-      GROK2API_ADMIN_PASSWORD_FILE: /run/secrets/grok2api-admin
-    secrets:
-      - grok2api-admin
-```
-
-## Environment variables
-
-### Required
-
-| name | meaning |
-|---|---|
-| `GROK2API_ADMIN_PASSWORD` | admin password (or use `_FILE`) |
-
-### Connection
-
-| name | default |
-|---|---|
-| `GROK2API_BASE_URL` | `http://grok2api:8000` |
-| `GROK2API_ADMIN_USERNAME` | `admin` |
-| `GROK2API_ADMIN_PASSWORD_FILE` | — |
-| `QUALITY_GUARD_STATE_DIR` | `/var/lib/grok2api-quality-guard` |
-
-### Detection
-
-| name | default |
-|---|---|
-| `QUALITY_GUARD_ENABLED` | `true` |
-| `QUALITY_GUARD_MODE` | `hybrid` (`active`/`passive`/`hybrid`) |
-| `QUALITY_GUARD_MODEL` | `grok-4.6` |
-| `QUALITY_GUARD_ACTIVE_INTERVAL_SECONDS` | `1800` |
-| `QUALITY_GUARD_PASSIVE_POLL_SECONDS` | `5` |
-| `QUALITY_GUARD_SOFT_TPS` | `500` |
-| `QUALITY_GUARD_HARD_TPS` | `1000` |
-| `QUALITY_GUARD_CONSECUTIVE_SOFT` | `2` |
-| `QUALITY_GUARD_CONSECUTIVE_ERRORS` | `2` |
-| `QUALITY_GUARD_QUARANTINE_SECONDS` | `300` |
-| `QUALITY_GUARD_MIN_HEALTHY_NODES` | `1` |
-| `QUALITY_GUARD_NODE_IDS` | empty = auto-discover enabled Build nodes |
-| `QUALITY_GUARD_PROMPT` / `QUALITY_GUARD_EXPECTED` | built-in prompt / `QUALITY_OK` |
-
-### Rotation (optional)
-
-| name | default |
-|---|---|
-| `QUALITY_GUARD_ROTATION_URL` | empty |
-| `QUALITY_GUARD_ROTATION_TOKEN` | empty |
-| `QUALITY_GUARD_ROTATABLE_NODE_IDS` | empty |
-
-## Config source precedence
-
-`--config-source` selects where thresholds come from:
-
-- `auto` (default) — uses `bootstrap.json` when it exists, otherwise environment
-- `env` — environment only
-- `bootstrap` — requires the file grok2api writes
-
-Run once to check wiring without starting a detection loop:
+Start it exactly as upstream documents:
 
 ```bash
+docker compose --profile quality-guard up -d
+```
+
+Enable detection on the grok2api side in `config.yaml`:
+
+```yaml
+qualityGuard:
+  enabled: true
+  mode: hybrid
+```
+
+The guard stays idle until `bootstrap.json` appears, which happens once
+grok2api starts with `qualityGuard.enabled: true`. That ordering is why
+`depends_on` only needs `service_healthy`, not a file wait.
+
+## Verify before wiring it in
+
+```bash
+# no bootstrap yet -> clean, explicit error (exit 2)
+docker run --rm ghcr.io/<owner>/<repo>/quality-guard:latest
+
+# with a bootstrap present -> validates and prints the resolved config
 docker run --rm \
-  -e GROK2API_ADMIN_USERNAME=admin \
-  -e GROK2API_ADMIN_PASSWORD=secret \
+  -v quality_guard_state:/var/lib/grok2api-quality-guard \
   ghcr.io/<owner>/<repo>/quality-guard:latest --check-config
 ```
 
 ```text
-configuration is valid (source=env, base=http://grok2api:8000, mode=hybrid, model=grok-4.6)
+configuration is valid
 ```
 
-## Resource sizing
+To exercise one detection cycle without daemonizing:
 
-The guard is a polling process: one small HTTP request per interval, no browser
-and no headless engine. Typical steady state is a few MB of RSS and near-zero
-CPU, so `mem_limit: 256m` / `cpus: 0.5` is generous. It performs **one probe per
-node per active interval**, not per user request — it will not add load to
-`grok2api` under traffic spikes.
+```bash
+docker run --rm \
+  -e GROK2API_BASE_URL=http://grok2api:8000 \
+  -v quality_guard_state:/var/lib/grok2api-quality-guard \
+  ghcr.io/<owner>/<repo>/quality-guard:latest --once
+```
+
+## Resource profile
+
+Polling process only: no browser, no headless engine, no per-request work. One
+probe per node per active interval. Steady state is a few MB of RSS and
+near-zero CPU, so no special limits are needed.
 
 Do **not** commit `quality-guard.env`, `bootstrap.json`, admin passwords, or node
 proxy URLs.
