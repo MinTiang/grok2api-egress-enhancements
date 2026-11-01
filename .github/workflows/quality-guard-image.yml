@@ -118,6 +118,8 @@ jobs:
         with:
           context: .
           file: ./sidecar/Dockerfile
+          # Both architectures are published; the smoke test below verifies
+          # each one actually runs.
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -127,58 +129,64 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test the built image
+      - name: Verify both architectures run
         if: github.event_name != 'pull_request'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         shell: bash
         run: |
           set -euo pipefail
-          img=$(printf '%s\n' "$TAGS" | head -n1)
-          echo "testing $img"
-          docker pull "$img"
+          tag=$(printf '%s\n' "$TAGS" | head -n1)
 
-          # No bootstrap.json (the realistic "grok2api not ready yet" case):
-          # the guard must exit with a clear message, not crash or hang.
-          out=$(docker run --rm "$img" 2>&1 || true)
-          echo "$out"
-          case "$out" in
-            *"bootstrap"*) echo "smoke ok: missing bootstrap reported cleanly" ;;
-            *) echo "::error::unexpected startup output"; exit 1 ;;
-          esac
+          echo "=== published manifest ==="
+          docker buildx imagetools inspect "$tag"
 
-          # A synthetic bootstrap must be accepted and produce a valid config.
+          # The guard is pure Python, so a platform mismatch is detectable only
+          # by actually executing it under the target architecture.
           tmp=$(mktemp -d)
-          cat > "$tmp/bootstrap.json" <<'JSON'
-          {
-            "version": 1,
-            "enabled": true,
-            "internal_token": "smoke-token",
-            "config": {
-              "model": "grok-4.6",
-              "mode": "passive",
-              "active_interval_seconds": 1800,
-              "passive_poll_seconds": 5,
-              "soft_tps": 500,
-              "hard_tps": 1000,
-              "consecutive_soft": 2,
-              "consecutive_errors": 2,
-              "quarantine_seconds": 300,
-              "no_account_backoff_seconds": 300,
-              "min_healthy_nodes": 1,
-              "max_output_tokens": 384,
-              "fail_closed": false,
-              "min_generation_ms": 1000,
-              "prompt": "reply with QUALITY_OK",
-              "expected": "QUALITY_OK"
-            }
-          }
-          JSON
-          out=$(docker run --rm \
-                  -v "$tmp:/var/lib/grok2api-quality-guard:ro" \
-                  "$img" --check-config 2>&1 || true)
-          echo "$out"
-          case "$out" in
-            *"configuration is valid"*) echo "smoke ok: bootstrap accepted" ;;
-            *) echo "::error::image rejected a valid bootstrap"; exit 1 ;;
-          esac
+          printf '%s' '{"version":1,"enabled":true,"internal_token":"smoke-token","config":{"model":"grok-4.6","mode":"passive","active_interval_seconds":1800,"passive_poll_seconds":5,"soft_tps":500,"hard_tps":1000,"consecutive_soft":2,"consecutive_errors":2,"quarantine_seconds":300,"no_account_backoff_seconds":300,"min_healthy_nodes":1,"max_output_tokens":384,"fail_closed":false,"min_generation_ms":1000,"prompt":"reply with QUALITY_OK","expected":"QUALITY_OK"}}' \
+            > "$tmp/bootstrap.json"
+          python3 -c "import json,sys; json.load(open('$tmp/bootstrap.json')); print('bootstrap json ok')"
+
+          for platform in linux/amd64 linux/arm64; do
+            echo "=== $platform ==="
+
+            # 1) no bootstrap -> clean, explicit refusal (exit 2), no traceback
+            set +e
+            out=$(docker run --rm --platform "$platform" "$tag" 2>&1)
+            code=$?
+            set -e
+            echo "$out"
+            [ "$code" -eq 2 ] || { echo "::error::$platform: expected exit 2 on missing bootstrap, got $code"; exit 1; }
+            case "$out" in
+              *"bootstrap file is missing"*) ;;
+              *) echo "::error::$platform: unclear missing-bootstrap message"; exit 1 ;;
+            esac
+            case "$out" in
+              *Traceback*) echo "::error::$platform: traceback on missing bootstrap"; exit 1 ;;
+              *) ;;
+            esac
+
+            # 2) valid bootstrap -> config validates and the interpreter runs
+            out=$(docker run --rm --platform "$platform" \
+                    -v "$tmp:/var/lib/grok2api-quality-guard:ro" \
+                    "$tag" --check-config 2>&1)
+            echo "$out"
+            case "$out" in
+              *"configuration is valid"*) ;;
+              *) echo "::error::$platform: rejected a valid bootstrap"; exit 1 ;;
+            esac
+
+            # 3) architecture actually matches
+            arch=$(docker run --rm --platform "$platform" --entrypoint python3 "$tag" \
+                     -c 'import platform; print(platform.machine())')
+            echo "$platform python arch: $arch"
+            case "$platform:$arch" in
+              linux/amd64:x86_64) ;;
+              linux/arm64:aarch64|linux/arm64:arm64) ;;
+              *) echo "::error::architecture mismatch: $platform reported $arch"; exit 1 ;;
+            esac
+
+            echo "smoke ok: $platform"
+          done
