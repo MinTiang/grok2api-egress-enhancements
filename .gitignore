@@ -4,6 +4,8 @@
 egress-gen/
 residential.dump
 scripts/__pycache__/
+sidecar/__pycache__/
+sidecar/*.pyc
 
 # CPA plugin build and runtime artifacts
 cpa-plugin/go/*.so

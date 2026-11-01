@@ -23,6 +23,7 @@ import signal
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -51,7 +52,32 @@ DEFAULT_FORCE_ACCOUNT_SWITCH_SECONDS = 120
 
 BOOTSTRAP_VERSION = 1
 BOOTSTRAP_FILE = Path("/var/lib/grok2api-quality-guard/bootstrap.json")
-INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
+STATE_DIR = Path(os.getenv("QUALITY_GUARD_STATE_DIR") or "/var/lib/grok2api-quality-guard")
+
+# Official admin surface used by the stock grok2api container.
+ADMIN_LOGIN_PATH = "/api/admin/v1/auth/login"
+ADMIN_API_PREFIX = "/api/admin/v1/egress-quality-guard"
+
+DEFAULT_PROMPT = (
+    "Reply with a single sentence of at least twenty words explaining why "
+    "stable network egress matters for an API gateway. Then print QUALITY_OK "
+    "on its own final line."
+)
+DEFAULT_EXPECTED = "QUALITY_OK"
+
+
+def _admin_password() -> str:
+    """Admin password from env or a mounted file. Never logged."""
+    password = (os.getenv("GROK2API_ADMIN_PASSWORD") or "").strip()
+    if password:
+        return password
+    path = (os.getenv("GROK2API_ADMIN_PASSWORD_FILE") or "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -122,7 +148,8 @@ class GuardDisabled(RuntimeError):
 @dataclasses.dataclass(frozen=True)
 class Config:
     base_url: str
-    internal_token: str
+    admin_username: str
+    admin_password: str
     model: str
     node_ids: tuple[str, ...]
     mode: str
@@ -155,6 +182,69 @@ class Config:
     runtime_config_file: Path
 
     @classmethod
+    def from_env(cls) -> "Config":
+        """Build the whole config from environment variables only.
+
+        No bootstrap.json and no internal token: the sidecar logs in with the
+        same admin credentials an operator uses, so compose only needs an
+        ``image:`` plus credentials.
+        """
+
+        def _num(name: str, default: float) -> float:
+            raw = (os.getenv(name) or "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be numeric") from exc
+
+        def _int(name: str, default: int) -> int:
+            return int(_num(name, default))
+
+        def _csv(name: str) -> tuple[str, ...]:
+            raw = os.getenv(name) or ""
+            return tuple(dict.fromkeys(v.strip() for v in raw.split(",") if v.strip()))
+
+        config = cls(
+            base_url=(os.getenv("GROK2API_BASE_URL") or "http://grok2api:8000").strip() or "http://grok2api:8000",
+            admin_username=(os.getenv("GROK2API_ADMIN_USERNAME") or "admin").strip() or "admin",
+            admin_password=_admin_password(),
+            model=(os.getenv("QUALITY_GUARD_MODEL") or "grok-4.6").strip(),
+            node_ids=_csv("QUALITY_GUARD_NODE_IDS"),
+            mode=(os.getenv("QUALITY_GUARD_MODE") or "hybrid").strip().lower(),
+            active_interval_seconds=_int("QUALITY_GUARD_ACTIVE_INTERVAL_SECONDS", 1800),
+            passive_poll_seconds=_int("QUALITY_GUARD_PASSIVE_POLL_SECONDS", 5),
+            passive_page_size=_int("QUALITY_GUARD_PASSIVE_PAGE_SIZE", 200),
+            passive_max_pages=_int("QUALITY_GUARD_PASSIVE_MAX_PAGES", 10),
+            jitter_seconds=_int("QUALITY_GUARD_JITTER_SECONDS", 30),
+            request_timeout_seconds=_int("QUALITY_GUARD_REQUEST_TIMEOUT_SECONDS", 120),
+            soft_tps=_num("QUALITY_GUARD_SOFT_TPS", 500),
+            hard_tps=_num("QUALITY_GUARD_HARD_TPS", 1000),
+            consecutive_soft=_int("QUALITY_GUARD_CONSECUTIVE_SOFT", 2),
+            consecutive_errors=_int("QUALITY_GUARD_CONSECUTIVE_ERRORS", 2),
+            quarantine_seconds=_int("QUALITY_GUARD_QUARANTINE_SECONDS", 300),
+            no_account_backoff_seconds=_int("QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS", 300),
+            min_healthy_nodes=_int("QUALITY_GUARD_MIN_HEALTHY_NODES", 1),
+            max_output_tokens=_int("QUALITY_GUARD_MAX_OUTPUT_TOKENS", 384),
+            fail_closed=_env_bool("QUALITY_GUARD_FAIL_CLOSED", False),
+            enabled=_env_bool("QUALITY_GUARD_ENABLED", True),
+            quarantine_enabled=_env_bool("QUALITY_GUARD_QUARANTINE_ENABLED", True),
+            min_generation_ms=_int("QUALITY_GUARD_MIN_GENERATION_MS", 1000),
+            rotation_url=(os.getenv("QUALITY_GUARD_ROTATION_URL") or "").strip(),
+            rotation_token=os.getenv("QUALITY_GUARD_ROTATION_TOKEN") or "",
+            rotation_timeout_seconds=_int("QUALITY_GUARD_ROTATION_TIMEOUT_SECONDS", 45),
+            rotatable_node_ids=_csv("QUALITY_GUARD_ROTATABLE_NODE_IDS"),
+            prompt=(os.getenv("QUALITY_GUARD_PROMPT") or DEFAULT_PROMPT).strip(),
+            expected=(os.getenv("QUALITY_GUARD_EXPECTED") or DEFAULT_EXPECTED).strip(),
+            state_file=STATE_DIR / "state.json",
+            lock_file=STATE_DIR / "guard.lock",
+            runtime_config_file=STATE_DIR / "runtime-config.json",
+        )
+        config.validate()
+        return config
+
+    @classmethod
     def from_bootstrap(cls, path: Path = BOOTSTRAP_FILE) -> "Config":
         try:
             with path.open("r", encoding="utf-8") as handle:
@@ -170,13 +260,13 @@ class Config:
         values = payload.get("config")
         if not isinstance(values, dict):
             raise ValueError("quality guard bootstrap config is missing")
-        token = str(payload.get("internal_token") or "").strip()
         node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("node_ids", []) if str(value).strip()))
         rotatable_node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("rotatable_node_ids", []) if str(value).strip()))
         config = cls(
             # Prefer compose service DNS; allow override for host-network / custom topologies.
             base_url=(os.environ.get("GROK2API_BASE_URL") or "http://grok2api:8000").strip() or "http://grok2api:8000",
-            internal_token=token,
+            admin_username=(os.getenv("GROK2API_ADMIN_USERNAME") or "admin").strip() or "admin",
+            admin_password=_admin_password(),
             model=str(values.get("model") or "").strip(),
             node_ids=node_ids,
             mode=str(values.get("mode") or "").strip().lower(),
@@ -204,9 +294,9 @@ class Config:
             rotatable_node_ids=rotatable_node_ids,
             prompt=str(values.get("prompt") or "").strip(),
             expected=str(values.get("expected") or "").strip(),
-            state_file=Path("/var/lib/grok2api-quality-guard/state.json"),
-            lock_file=Path("/var/lib/grok2api-quality-guard/guard.lock"),
-            runtime_config_file=Path("/var/lib/grok2api-quality-guard/runtime-config.json"),
+            state_file=STATE_DIR / "state.json",
+            lock_file=STATE_DIR / "guard.lock",
+            runtime_config_file=STATE_DIR / "runtime-config.json",
         )
         config.validate()
         return config
@@ -215,8 +305,11 @@ class Config:
         parsed = urllib.parse.urlparse(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("GROK2API_BASE_URL must be an absolute HTTP(S) URL")
-        if not self.internal_token:
-            raise ValueError("quality guard bootstrap internal token is missing")
+        if not self.admin_username or not self.admin_password:
+            raise ValueError(
+                "GROK2API_ADMIN_USERNAME and GROK2API_ADMIN_PASSWORD "
+                "(or GROK2API_ADMIN_PASSWORD_FILE) are required"
+            )
         if not self.model or not self.prompt or not self.expected:
             raise ValueError("model, prompt, and expected marker must not be empty")
         if self.mode not in {"active", "passive", "hybrid"}:
@@ -322,16 +415,71 @@ class ApiError(RuntimeError):
 
 
 class ApiClient:
+    """Admin-API client: logs in, retries once on 401."""
+
     def __init__(self, config: Config):
         self.config = config
         self.ssl_context = ssl.create_default_context()
+        self.token = ""
+        self._login_lock = threading.Lock()
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    def login(self) -> None:
+        body = json.dumps(
+            {"username": self.config.admin_username, "password": self.config.admin_password},
+            separators=(",", ":"),
+        ).encode()
+        request = urllib.request.Request(
+            self.config.base_url + ADMIN_LOGIN_PATH,
+            data=body,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=self.ssl_context) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.loads(exc.read().decode("utf-8", "replace")).get("error") or {}
+            except (ValueError, OSError):
+                error = {}
+            code = str(error.get("code") or "login_failed")
+            if exc.code == 401:
+                raise RuntimeError(f"admin login rejected: {code}") from exc
+            raise RuntimeError(f"admin login failed: HTTP {exc.code} {code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"admin login unreachable: {type(exc).__name__}") from exc
+        data = payload.get("data", payload)
+        token = ""
+        if isinstance(data, dict):
+            token = str(data.get("token") or data.get("accessToken") or "")
+            nested = data.get("tokens")
+            if not token and isinstance(nested, dict):
+                token = str(nested.get("accessToken") or nested.get("token") or "")
+            session = data.get("session")
+            if not token and isinstance(session, dict):
+                token = str(session.get("token") or session.get("accessToken") or "")
+        token = token.strip()
+        if not token:
+            raise RuntimeError("admin login did not return a token")
+        self.token = token
+
+    def _ensure_token(self) -> str:
+        if self.token:
+            return self.token
+        with self._login_lock:
+            if not self.token:
+                self.login()
+            return self.token
+
+    def invalidate_token(self) -> None:
+        self.token = ""
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None, retry_auth: bool = True) -> Any:
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        headers["Authorization"] = f"Bearer {self.config.internal_token}"
+        headers["Authorization"] = f"Bearer {self._ensure_token()}"
         request = urllib.request.Request(self.config.base_url + path, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=self.ssl_context) as response:
@@ -341,6 +489,9 @@ class ApiClient:
                 payload = json.loads(exc.read().decode("utf-8", "replace"))
             except (ValueError, OSError):
                 payload = {}
+            if exc.code == 401 and retry_auth and path != ADMIN_LOGIN_PATH:
+                self.invalidate_token()
+                return self._request(method, path, body, retry_auth=False)
             error = payload.get("error") or {}
             raise ApiError(exc.code, str(error.get("code", "request_failed")), str(error.get("message", "request failed"))) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -354,7 +505,7 @@ class ApiClient:
         page = 1
         while True:
             query = urllib.parse.urlencode({"page": page, "pageSize": page_size, "scope": "grok_build"})
-            payload = self._request("GET", f"{INTERNAL_API_PREFIX}/egress-nodes?{query}")
+            payload = self._request("GET", f"{ADMIN_API_PREFIX}/egress-nodes?{query}")
             batch = list(payload.get("items") or [])
             total = max(0, int(payload.get("total") or 0))
             added = 0
@@ -372,7 +523,7 @@ class ApiClient:
             page += 1
 
     def fixed_fallback_node_ids(self) -> set[str]:
-        payload = self._request("GET", f"{INTERNAL_API_PREFIX}/egress-operations")
+        payload = self._request("GET", f"{ADMIN_API_PREFIX}/egress-operations")
         result: set[str] = set()
         for fallback in (payload.get("fallbacks") or {}).values():
             if not isinstance(fallback, dict) or fallback.get("mode") != "fixed":
@@ -383,10 +534,10 @@ class ApiClient:
         return result
 
     def quality_test(self, node_id: str) -> dict[str, Any]:
-        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test")
+        return self._request("POST", f"{ADMIN_API_PREFIX}/egress-nodes/{node_id}/quality-test")
 
     def connectivity_test(self, node_id: str) -> dict[str, Any]:
-        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/test")
+        return self._request("POST", f"{ADMIN_API_PREFIX}/egress-nodes/{node_id}/test")
 
     def list_audits(self, cursor: str = "") -> dict[str, Any]:
         query = {
@@ -396,7 +547,7 @@ class ApiClient:
         }
         if cursor:
             query["cursor"] = cursor
-        return self._request("GET", f"{INTERNAL_API_PREFIX}/request-audits?{urllib.parse.urlencode(query)}")
+        return self._request("GET", f"{ADMIN_API_PREFIX}/request-audits?{urllib.parse.urlencode(query)}")
 
     def find_audit_account_id(self, request_id: str) -> str:
         """Resolve the account used by a just-finished quality probe."""
@@ -416,7 +567,7 @@ class ApiClient:
         return ""
 
     def set_enabled(self, node_id: str, enabled: bool) -> int:
-        result = self._request("PATCH", f"{INTERNAL_API_PREFIX}/egress-nodes/batch", {"ids": [node_id], "enabled": enabled})
+        result = self._request("PATCH", f"{ADMIN_API_PREFIX}/egress-nodes/batch", {"ids": [node_id], "enabled": enabled})
         return int(result.get("updated") or 0)
 
     def rotate_node(self, node_id: str, old_exit_ip: str = "") -> dict[str, Any]:
@@ -1871,10 +2022,19 @@ def acquire_lock(path: Path):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Active and passive quality guard for grok2api egress nodes")
     parser.add_argument("--once", action="store_true", help="run one cycle for each detector enabled by the selected mode")
-    parser.add_argument("--check-config", action="store_true", help="validate config.yaml bootstrap and exit")
+    parser.add_argument("--check-config", action="store_true", help="validate configuration and exit")
+    parser.add_argument(
+        "--config-source",
+        choices=("auto", "env", "bootstrap"),
+        default="auto",
+        help="threshold source; auto uses bootstrap.json when present, else environment",
+    )
     args = parser.parse_args(argv)
     try:
-        base_config = Config.from_bootstrap()
+        source = args.config_source
+        if source == "auto":
+            source = "bootstrap" if BOOTSTRAP_FILE.exists() else "env"
+        base_config = Config.from_bootstrap() if source == "bootstrap" else Config.from_env()
         reloader = RuntimeConfigReloader(base_config)
         config, _, runtime_error = reloader.reload(force=True)
         if runtime_error is not None:
@@ -1886,7 +2046,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
     if args.check_config:
-        print("configuration is valid")
+        print(
+            "configuration is valid "
+            f"(source={source}, base={config.base_url}, mode={config.mode}, model={config.model})"
+        )
         return 0
     try:
         lock = acquire_lock(config.lock_file)

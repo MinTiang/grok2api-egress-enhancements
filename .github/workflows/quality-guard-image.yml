@@ -1,0 +1,161 @@
+# Build and publish the Quality Guard sidecar image.
+#
+# Publishes ghcr.io/<owner>/<repo>/quality-guard with tags:
+#   latest      - newest build from the default branch
+#   sha-<short> - pinned build, use this in compose for reproducibility
+#   vX.Y.Z      - when pushed as a git tag
+#
+# Compose usage (one image reference is all that is needed):
+#   quality-guard:
+#     image: ghcr.io/<owner>/<repo>/quality-guard:latest
+#     environment:
+#       GROK2API_BASE_URL: http://grok2api:8000
+#       GROK2API_ADMIN_USERNAME: admin
+#       GROK2API_ADMIN_PASSWORD_FILE: /run/secrets/admin-password
+
+name: quality-guard image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "sidecar/quality_guard.py"
+      - "sidecar/Dockerfile"
+      - ".github/workflows/quality-guard-image.yml"
+  pull_request:
+    paths:
+      - "sidecar/quality_guard.py"
+      - "sidecar/Dockerfile"
+      - ".github/workflows/quality-guard-image.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/quality-guard
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Source checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=sidecar/quality_guard.py
+          test -s "$f"
+          # The image installs no packages; a third-party import would break it.
+          if grep -nE '^\s*(import|from)\s+(requests|httpx|aiohttp|yaml|bs4|pydantic)\b' "$f"; then
+            echo "::error::non-stdlib import found; the image has no pip dependencies"
+            exit 1
+          fi
+          python3 -m py_compile "$f"
+          # Official-form wiring must be present.
+          grep -q '/api/admin/v1/auth/login' "$f" || { echo "::error::missing admin login route"; exit 1; }
+          grep -q '/api/admin/v1/egress-quality-guard' "$f" || { echo "::error::missing admin guard prefix"; exit 1; }
+          if grep -q 'INTERNAL_API_PREFIX' "$f"; then
+            echo "::error::internal API prefix still referenced"
+            exit 1
+          fi
+          echo "source ok: $(stat -c%s "$f") bytes"
+
+      - name: Config smoke (env source)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=sidecar/quality_guard.py
+          # No credentials -> must be a clean config error, not a traceback.
+          if GROK2API_ADMIN_PASSWORD= python3 "$f" --check-config --config-source env; then
+            echo "::error::guard accepted missing credentials"
+            exit 1
+          fi
+          # With credentials -> must validate.
+          out=$(GROK2API_ADMIN_USERNAME=admin GROK2API_ADMIN_PASSWORD=test \
+                python3 "$f" --check-config --config-source env)
+          echo "$out"
+          case "$out" in
+            *"configuration is valid"*) ;;
+            *) echo "::error::env config did not validate"; exit 1 ;;
+          esac
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./sidecar/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the built image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          img=$(printf '%s\n' "$TAGS" | head -n1)
+          echo "testing $img"
+          docker pull "$img"
+          # Missing credentials must fail loudly, not hang.
+          if docker run --rm "$img" --check-config; then
+            echo "::error::image accepted missing credentials"
+            exit 1
+          fi
+          # Credentials present -> configuration validates.
+          out=$(docker run --rm \
+                  -e GROK2API_ADMIN_USERNAME=admin \
+                  -e GROK2API_ADMIN_PASSWORD=test \
+                  "$img" --check-config)
+          echo "$out"
+          case "$out" in
+            *"configuration is valid"*) echo "smoke ok" ;;
+            *) echo "::error::image failed config validation"; exit 1 ;;
+          esac

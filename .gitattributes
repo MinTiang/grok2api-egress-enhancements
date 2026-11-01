@@ -1,0 +1,9 @@
+
+# Keep Linux-facing sources LF.
+*.py text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+
+# Patch files must keep exact bytes (git am replays them).
+*.patch -text
+*.diff -text
