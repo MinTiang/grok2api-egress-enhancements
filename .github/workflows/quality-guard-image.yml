@@ -26,11 +26,13 @@ on:
       - "v*"
     paths:
       - "sidecar/quality_guard.py"
+      - "sidecar/quality_guard_test.py"
       - "sidecar/Dockerfile"
       - ".github/workflows/quality-guard-image.yml"
   pull_request:
     paths:
       - "sidecar/quality_guard.py"
+      - "sidecar/quality_guard_test.py"
       - "sidecar/Dockerfile"
       - ".github/workflows/quality-guard-image.yml"
   workflow_dispatch:
@@ -47,6 +49,14 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run classifier tests
+        run: python sidecar/quality_guard_test.py
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'

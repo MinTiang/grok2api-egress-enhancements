@@ -42,7 +42,8 @@ RUN addgroup -S -g 10001 quality-guard \
  && chmod 0700 /var/lib/grok2api-quality-guard
 
 COPY sidecar/quality_guard.py /usr/local/bin/grok2api-egress-quality-guard
-RUN chmod 0755 /usr/local/bin/grok2api-egress-quality-guard
+COPY sidecar/preflight.py /usr/local/bin/quality-guard-preflight
+RUN chmod 0755 /usr/local/bin/grok2api-egress-quality-guard /usr/local/bin/quality-guard-preflight
 
 VOLUME ["/var/lib/grok2api-quality-guard"]
 

@@ -18,3 +18,5 @@ cpa-plugin/**/.env*
 cpa-plugin/**/auths/
 cpa-plugin/**/__pycache__/
 cpa-plugin/**/*.pyc
+__pycache__/
+*.pyc

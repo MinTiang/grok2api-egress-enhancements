@@ -19,11 +19,34 @@ The runtime contract is unchanged from
 There are no extra credentials to supply: the shared `quality_guard_state`
 volume carries the bootstrap file and the token.
 
+## Version pairing
+
+The guard adapts to whichever generation of the main service it is paired
+with, because the internal token is scoped to a fixed route allowlist:
+
+| main service | guard behaviour |
+|---|---|
+| has `/egress-leases/*` | account-bound proxy nodes are quarantined per account lease, pinned to the same account on recovery |
+| lacks `/egress-leases/*` | lease routes answer 403; degrade is handled per account through the admin API (needs `GROK2API_ADMIN_*`), and windowed escalation to the node |
+| either | account-bound proxy nodes are **never** disabled node-wide |
+
+Run the preflight before switching images:
+
+```bash
+docker compose run --rm egress-quality-guard quality-guard-preflight
+```
+
+It reports base URL, mode, node counts, which routes answer, whether the lease
+API is present, and whether the current `runtime-config.json` validates — the
+three things that silently misconfigure a guard.
+
 ## Files
 
 | file | role |
 |------|------|
 | `quality_guard.py` | sidecar process (stdlib only) |
+| `quality_guard_test.py` | classifier + contract tests, run in CI before the image builds |
+| `preflight.py` | route/capability check against a live grok2api |
 | `Dockerfile` | standalone image, published to GHCR |
 | `QUALITY_GUARD.md` | operator / agent reference (desensitized) |
 

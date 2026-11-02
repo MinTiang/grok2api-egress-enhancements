@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fcntl
 import json
 import os
 import random
@@ -30,9 +29,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+try:  # POSIX only; imported lazily so the classifiers stay unit-testable anywhere.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows dev boxes
+    fcntl = None  # type: ignore[assignment]
+
 
 RUNTIME_CONFIG_FIELDS = {
-    "enabled",
     "mode",
     "active_interval_seconds",
     "passive_poll_seconds",
@@ -43,15 +46,34 @@ RUNTIME_CONFIG_FIELDS = {
     "quarantine_seconds",
     "min_healthy_nodes",
 }
+# `enabled` is written by some older local builds and by the admin toggle, but
+# it is NOT part of the upstream runtime-config schema. Treating it as required
+# made every upstream-written runtime file fail validation, so the guard kept
+# running on stale thresholds while logging runtime_config_rejected.
+RUNTIME_CONFIG_OPTIONAL_FIELDS = {"enabled"}
 
 ACCOUNT_DEGRADE_WINDOW_SECONDS = 24 * 60 * 60
 ACCOUNT_DEGRADE_MUTE_AFTER = 3
 DEFAULT_FORCE_ACCOUNT_SWITCH_SECONDS = 120
+DEFAULT_DEGRADE_MIN_OUTPUT_TOKENS = 32
+DEFAULT_ACCOUNT_DEGRADE_WINDOW_SECONDS = 600
+DEFAULT_ACCOUNT_DEGRADE_ACCOUNTS = 3
+THINKING_GUARD_MIN_OUTPUT_TOKENS = 64
+LEASE_PAGE_SIZE = 1000
+LEASE_SCAN_MAX_PAGES = 1000
+LEASE_RECOVERY_MAX_PER_CYCLE = 8
+LEASE_RECOVERY_BACKOFF_BASE_SECONDS = 30
+LEASE_RECOVERY_BACKOFF_MAX_SECONDS = 1800
 
 
 BOOTSTRAP_VERSION = 1
 BOOTSTRAP_FILE = Path("/var/lib/grok2api-quality-guard/bootstrap.json")
 INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
+# Upstream baseline for the panel TPS formula. Kept here so the guard does not
+# need a second copy of the numbers living in the main service.
+DEGRADE_SOFT_TPS = 500.0
+DEGRADE_HARD_TPS = 1000.0
+DEGRADE_MIN_GEN_MS = 1000
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -143,6 +165,9 @@ class Config:
     fail_closed: bool
     enabled: bool
     quarantine_enabled: bool
+    account_degrade_enabled: bool
+    account_degrade_window_seconds: int
+    account_degrade_accounts: int
     min_generation_ms: int
     rotation_url: str
     rotation_token: str
@@ -197,6 +222,19 @@ class Config:
             fail_closed=bool(values.get("fail_closed")),
             enabled=True,
             quarantine_enabled=_env_bool("QUALITY_GUARD_QUARANTINE_ENABLED", True),
+            account_degrade_enabled=_env_bool("QUALITY_GUARD_ACCOUNT_DEGRADE_ENABLED", True),
+            account_degrade_window_seconds=_env_int(
+                "QUALITY_GUARD_ACCOUNT_DEGRADE_WINDOW_SECONDS",
+                DEFAULT_ACCOUNT_DEGRADE_WINDOW_SECONDS,
+                60,
+                86400,
+            ),
+            account_degrade_accounts=_env_int(
+                "QUALITY_GUARD_ACCOUNT_DEGRADE_ACCOUNTS",
+                DEFAULT_ACCOUNT_DEGRADE_ACCOUNTS,
+                1,
+                100,
+            ),
             min_generation_ms=int(values.get("min_generation_ms") or 0),
             rotation_url=str(values.get("rotation_url") or "").strip(),
             rotation_token=str(values.get("rotation_token") or ""),
@@ -262,23 +300,27 @@ def load_runtime_config(base: Config, path: Path) -> Config:
     if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("settings"), dict):
         raise ValueError("unsupported runtime quality guard config")
     settings = value["settings"]
-    unknown = set(settings) - RUNTIME_CONFIG_FIELDS
+    unknown = set(settings) - RUNTIME_CONFIG_FIELDS - RUNTIME_CONFIG_OPTIONAL_FIELDS
     if unknown:
         raise ValueError("runtime quality guard config contains unknown fields")
-    # Runtime files written before the plugin toggle existed stay enabled.
     settings = dict(settings)
+    # Upstream never writes `enabled`; older local builds did. Default it on so
+    # both schemas validate into the same Config.
     settings.setdefault("enabled", True)
-    if set(settings) != RUNTIME_CONFIG_FIELDS:
+    missing = RUNTIME_CONFIG_FIELDS - set(settings)
+    if missing:
         raise ValueError("runtime quality guard config is incomplete")
     if not isinstance(settings["mode"], str):
         raise ValueError("runtime quality guard mode must be a string")
     if not isinstance(settings["enabled"], bool):
         raise ValueError("runtime quality guard enabled field is invalid")
-    integer_fields = RUNTIME_CONFIG_FIELDS - {"enabled", "mode", "soft_tps", "hard_tps"}
+    integer_fields = RUNTIME_CONFIG_FIELDS - {"mode", "soft_tps", "hard_tps"}
     if any(isinstance(settings[name], bool) or not isinstance(settings[name], int) for name in integer_fields):
         raise ValueError("runtime quality guard integer field is invalid")
     if any(isinstance(settings[name], bool) or not isinstance(settings[name], (int, float)) for name in {"soft_tps", "hard_tps"}):
         raise ValueError("runtime quality guard threshold is invalid")
+    # A field we do not consume must never be forwarded to replace().
+    settings = {name: value for name, value in settings.items() if name in RUNTIME_CONFIG_FIELDS | RUNTIME_CONFIG_OPTIONAL_FIELDS}
     config = dataclasses.replace(base, **settings)
     config.validate()
     return config
@@ -382,8 +424,51 @@ class ApiClient:
                 result.add(node_id)
         return result
 
-    def quality_test(self, node_id: str) -> dict[str, Any]:
-        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test")
+    def quality_test(self, node_id: str, profile_id: str = "", account_id: str = "") -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if profile_id:
+            body["profileId"] = profile_id
+        if account_id:
+            # Pins the probe to the same account so lease recovery verifies the
+            # account that actually degraded, not a random one on the node.
+            body["accountId"] = account_id
+        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test", body or None)
+
+    def list_leases(self) -> list[dict[str, Any]]:
+        """Egress leases for account-bound proxy nodes. Empty when unsupported."""
+        values: list[dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _page in range(LEASE_SCAN_MAX_PAGES):
+            query: dict[str, Any] = {"limit": LEASE_PAGE_SIZE}
+            if cursor:
+                query["cursor"] = cursor
+            payload = self._request("GET", f"{INTERNAL_API_PREFIX}/egress-leases?{urllib.parse.urlencode(query)}")
+            values.extend(list(payload.get("items") or []))
+            if not payload.get("hasMore"):
+                return values
+            next_cursor = str(payload.get("nextCursor") or "")
+            if not next_cursor or next_cursor == cursor or next_cursor in seen_cursors:
+                raise RuntimeError("lease pagination did not advance")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("lease pagination exceeded the safety limit")
+
+    def quarantine_lease(self, node_id: str, account_id: str, reason: str) -> dict[str, Any]:
+        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-leases/quarantine", {
+            "nodeId": node_id,
+            "accountId": account_id,
+            "reason": reason,
+            "quarantineSeconds": self.config.quarantine_seconds,
+        })
+
+    def restore_lease(self, node_id: str, account_id: str, version: str) -> bool:
+        result = self._request("POST", f"{INTERNAL_API_PREFIX}/egress-leases/restore", {
+            "nodeId": node_id,
+            "accountId": account_id,
+            "version": version,
+        })
+        return bool(result.get("restored"))
 
     def connectivity_test(self, node_id: str) -> dict[str, Any]:
         return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/test")
@@ -422,14 +507,11 @@ class ApiClient:
     def rotate_node(self, node_id: str, old_exit_ip: str = "") -> dict[str, Any]:
         if not self.config.rotation_url:
             raise RuntimeError("rotation endpoint is not configured")
-        rotation_url = self.config.rotation_url
-        if str(node_id) in {"48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58"}:
-            rotation_url = os.environ.get("KOOKEey_ROTATION_URL", "http://127.0.0.1:19100/rotate")
         data = json.dumps({"nodeId": node_id, "oldExitIp": old_exit_ip}, separators=(",", ":")).encode()
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if self.config.rotation_token:
             headers["Authorization"] = f"Bearer {self.config.rotation_token}"
-        request = urllib.request.Request(rotation_url, data=data, headers=headers, method="POST")
+        request = urllib.request.Request(self.config.rotation_url, data=data, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(
                 request,
@@ -551,23 +633,65 @@ class AdminApiClient:
         return int(result.get("updated") or 0)
 
 
+def generation_window_ms(first_token_ms: int, duration_ms: int, reasoning_tokens: int = 0) -> int:
+    """Token/s denominator shared by the panel, probes and the guard.
+
+    Ported from upstream ``audit.GenerationWindowMS``. Older audit rows may
+    measure the first token only when buffered reasoning was finally flushed.
+    For rows that do report reasoning tokens, a remaining tail shorter than
+    the first-token wait is a measurement artefact, not a burst: use the full
+    duration. Rows without reasoning evidence keep the tail so genuine
+    buffered output bursts stay visible to the fail-closed guard.
+    """
+    if duration_ms <= 0:
+        return 0
+    if first_token_ms < 0:
+        first_token_ms = 0
+    if first_token_ms >= duration_ms:
+        return 0
+    generation_ms = duration_ms - first_token_ms
+    if reasoning_tokens > 0 and generation_ms < first_token_ms and generation_ms < DEGRADE_MIN_GEN_MS:
+        return duration_ms
+    return generation_ms
+
+
+def output_tokens_per_second(output_tokens: int, first_token_ms: int, duration_ms: int, reasoning_tokens: int = 0) -> float:
+    if output_tokens <= 0:
+        return 0.0
+    generation_ms = generation_window_ms(first_token_ms, duration_ms, reasoning_tokens)
+    if generation_ms <= 0:
+        return 0.0
+    return float(output_tokens) * 1000 / float(generation_ms)
+
+
 def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
     if not bool(result.get("expectedMatched")):
         return "soft", "expected_marker_missing"
     output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
+    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
+    first_token_ms = int(result.get("firstTokenMs") or 0)
+    duration_ms = int(result.get("durationMs") or 0)
+    generation_ms = int(result.get("generationMs") or 0)
+    if generation_ms <= 0:
+        generation_ms = generation_window_ms(first_token_ms, duration_ms, reasoning_tokens)
     speed_value = result.get("outputTokensPerSecond")
     if speed_value is None:
         # Rolling upgrades may still expose panel-equivalent TPS under the legacy name.
         speed_value = result.get("visibleTokensPerSecond")
     speed = float(speed_value or 0.0)
-    generation_ms = int(result.get("generationMs") or 0)
-    if generation_ms <= 0:
-        generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
+    if speed <= 0:
+        speed = output_tokens_per_second(output_tokens, first_token_ms, duration_ms, reasoning_tokens)
+    # QUALITY_OK is a content marker, not a quality proof. The token / window /
+    # TPS rules below still decide, exactly as they do for user traffic.
     if output_tokens < 32:
         return "soft", "insufficient_output_tokens"
-    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
-    if output_tokens >= 64 and reasoning_tokens <= 0:
-        return "hard", "missing_thinking"
+    # Only judge missing thinking when the probe actually asked for thinking.
+    # The main service reports `thinkingRequired` per probe; previously the
+    # guard decided on its own, which flagged throughput probes and every
+    # non-thinking model as degraded.
+    if bool(result.get("thinkingRequired")):
+        if output_tokens >= THINKING_GUARD_MIN_OUTPUT_TOKENS and reasoning_tokens <= 0:
+            return "hard", "missing_thinking"
     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst"
     if config.fail_closed and generation_ms < config.min_generation_ms:
@@ -580,6 +704,16 @@ def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
 
 
 def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, float, int]:
+    """Classify one finished user stream. TPS only — never missing_thinking.
+
+    A missing-thinking sample is an *account* symptom: the exit delivered the
+    bytes, the account produced no reasoning. Upstream keeps that judgement on
+    the recovery probe (`classify_result` with `thinkingRequired`) and quarantines
+    an account lease, never the node. Doing it here used to isolate a whole
+    egress because one account answered a short prompt, and it contradicted the
+    request path, which explicitly refuses `usage.reasoning_tokens` as thinking
+    evidence.
+    """
     if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
         return "ignored", "not_build_stream", 0.0, 0
     status = int(value.get("statusCode") or 0)
@@ -588,14 +722,14 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     first_token_ms = value.get("firstTokenMs")
     if first_token_ms is None:
         return "ignored", "missing_first_token", 0.0, 0
-    generation_ms = int(value.get("durationMs") or 0) - int(first_token_ms)
+    first_token_ms = int(first_token_ms)
+    duration_ms = int(value.get("durationMs") or 0)
     output_tokens = max(0, int(value.get("outputTokens") or 0))
+    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+    generation_ms = generation_window_ms(first_token_ms, duration_ms, reasoning_tokens)
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
     speed = float(output_tokens) * 1000 / float(generation_ms)
-    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
-    if output_tokens >= 32 and reasoning_tokens <= 0:
-        return "hard", "missing_thinking", speed, output_tokens
     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst", speed, output_tokens
     if speed >= config.hard_tps:
@@ -634,6 +768,8 @@ def default_node_state() -> dict[str, Any]:
         "last_rank_at": 0.0,
         "quarantine_source": "",
         "passive_degrade_repeats": 0,
+        "degrade_account_samples": [],
+        "degrade_account_ids": [],
     }
 
 
@@ -744,6 +880,8 @@ class Guard:
         ranking.setdefault("last_table", [])
         ranking.setdefault("last_moves", [])
         self._admin: AdminApiClient | None = None
+        # None = not probed yet, True/False = cached capability of the main service.
+        self._lease_supported: bool | None = None
         self._resolved_node_ids: list[str] = []
         self._update_guard_metadata()
         self._save()
@@ -792,6 +930,336 @@ class Guard:
             current.setdefault(key, value)
         return current
 
+    def _note_node_degrade_account(self, node_id: str, account_id: str, now: float) -> int:
+        """Track distinct accounts that degraded on this node in a short window.
+
+        One missing-thinking sample clears an account, not an exit. The node is
+        only quarantined when several *different* accounts degrade on it inside
+        the window, which is the signature of a real egress problem rather than
+        a single bad account. The window list is kept small on purpose: this is
+        a rate check, not an audit log.
+        """
+        state = self._state_for(node_id)
+        cutoff = now - float(self.config.account_degrade_window_seconds)
+        # Entries are stored alongside their timestamp so old ids age out.
+        stamps = [
+            (str(item.get("account_id") or ""), float(item.get("ts") or 0.0))
+            for item in state.get("degrade_account_samples", [])
+            if isinstance(item, dict)
+        ]
+        stamps = [(aid, ts) for aid, ts in stamps if aid and ts >= cutoff]
+        if account_id:
+            stamps.append((account_id, now))
+        state["degrade_account_samples"] = [
+            {"account_id": aid, "ts": ts} for aid, ts in stamps[-50:]
+        ]
+        state["degrade_account_ids"] = sorted({aid for aid, _ts in stamps})
+        return len(state["degrade_account_ids"])
+
+    @staticmethod
+    def _is_lease_scoped(node: dict[str, Any]) -> bool:
+        """Whether one logical node expands to account-specific sticky leases.
+
+        Mirrors upstream. Nodes built from proxy templates containing
+        ``{account}`` (Resin etc.) get a separate exit per account, so a
+        node-wide probe or node-wide disable cannot represent them.
+        """
+        return bool(node.get("accountBoundProxy"))
+
+    def _admin_credentials_missing(self) -> bool:
+        return not str(self.rank.get("admin_username") or "") or not str(self.rank.get("admin_password") or "")
+
+    def _lease_api_available(self, force: bool = False, failed: bool = False) -> bool:
+        """Discover once whether this main service exposes the lease routes.
+
+        Upstream added ``/egress-leases/*`` behind the same internal token, and
+        the internal credential is scoped to a fixed route allowlist, so an
+        older image answers 403/404 rather than erroring loudly. Probing once
+        and caching keeps a misconfigured pairing from logging on every audit.
+        """
+        if failed:
+            if self._lease_supported is not False:
+                log_event("lease_api_unavailable", reason="request_failed")
+            self._lease_supported = False
+            return False
+        if self._lease_supported is not None and not force:
+            return self._lease_supported
+        try:
+            self.api.list_leases()
+        except ApiError as exc:
+            if exc.status in {401, 403, 404, 405, 501}:
+                log_event("lease_api_unavailable", status=exc.status, code=exc.code)
+                self._lease_supported = False
+                return False
+            # A 5xx is transient; keep the previous answer and let the caller
+            # fall through to the account-switch path for this sample.
+            log_event("lease_api_probe_inconclusive", status=exc.status, code=exc.code)
+            return False
+        except Exception as exc:
+            log_event("lease_api_probe_inconclusive", error_type=type(exc).__name__)
+            return False
+        log_event("lease_api_available")
+        self._lease_supported = True
+        return True
+
+    def _defer_lease_recovery(self, key: str, now: float) -> None:
+        recovery = self.state.setdefault("lease_recovery", {})
+        current = recovery.get(key) or {}
+        failures = min(16, int(current.get("failures") or 0) + 1)
+        delay = min(LEASE_RECOVERY_BACKOFF_MAX_SECONDS, LEASE_RECOVERY_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)))
+        recovery[key] = {"failures": failures, "next_attempt_at": now + delay}
+
+    def _recover_lease(self, node: dict[str, Any], lease: dict[str, Any], now: float) -> None:
+        """Verify the account on its own node, then release the lease."""
+        node_id = str(lease.get("nodeId") or "")
+        account_id = str(lease.get("accountId") or "")
+        version = str(lease.get("version") or "")
+        if not node_id or not account_id or not version:
+            return
+        key = f"{node_id}:{account_id}"
+        self._bump_statistic("active", "total")
+        try:
+            # Pin the probe to the degraded account: a healthy sample from a
+            # different account behind the same node proves nothing.
+            result = self.api.quality_test(node_id, account_id=account_id)
+            classification, reason = classify_result(result, self.config)
+        except Exception as exc:
+            self._bump_statistic("active", "errors")
+            self._defer_lease_recovery(key, now)
+            log_event(
+                "lease_recovery_probe_failed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=account_id,
+                error_type=type(exc).__name__,
+            )
+            return
+        self._record_probe(node, result, classification, reason, now)
+        if classification != "healthy":
+            try:
+                self.api.quarantine_lease(node_id, account_id, reason)
+            except Exception as exc:
+                log_event(
+                    "lease_quarantine_extension_failed",
+                    node_id=node_id,
+                    account_id=account_id,
+                    error_type=type(exc).__name__,
+                )
+                self._defer_lease_recovery(key, now)
+            return
+        try:
+            restored = self.api.restore_lease(node_id, account_id, version)
+        except ApiError as exc:
+            if exc.code == "qualityLeaseConflict":
+                # Someone else already moved this lease; drop our stale copy.
+                self.state.setdefault("leases", {}).pop(key, None)
+                self.state.setdefault("lease_recovery", {}).pop(key, None)
+                log_event("lease_restore_stale", node_id=node_id, account_id=account_id)
+                return
+            self._defer_lease_recovery(key, now)
+            log_event("lease_restore_failed", node_id=node_id, account_id=account_id, error_type=type(exc).__name__)
+            return
+        except Exception as exc:
+            self._defer_lease_recovery(key, now)
+            log_event("lease_restore_failed", node_id=node_id, account_id=account_id, error_type=type(exc).__name__)
+            return
+        if not restored:
+            self._defer_lease_recovery(key, now)
+            return
+        self.state.setdefault("leases", {}).pop(key, None)
+        self.state.setdefault("lease_recovery", {}).pop(key, None)
+        self._bump_statistic("actions", "restored")
+        append_state_event(
+            self.state,
+            "lease_restored",
+            node_id=node_id,
+            node_name=node.get("name"),
+            account_id=account_id,
+            reason="quality_probe_healthy",
+        )
+        log_event(
+            "lease_restored",
+            node_id=node_id,
+            node_name=node.get("name"),
+            account_id=account_id,
+            reason="quality_probe_healthy",
+        )
+
+    def _reconcile_leases(self, nodes: list[dict[str, Any]], now: float) -> None:
+        """Bring local lease state in line with the backend, then recover due ones.
+
+        The backend is authoritative: a lease that disappeared was released or
+        rewritten elsewhere, so the local copy must go. Recovery is capped per
+        cycle so a large expiry wave cannot monopolise one loop.
+        """
+        if not self._lease_api_available():
+            return
+        try:
+            values = self.api.list_leases()
+        except Exception as exc:
+            log_event("lease_reconciliation_failed", error_type=type(exc).__name__)
+            return
+        node_by_id = {str(node.get("id") or ""): node for node in nodes}
+        state_leases = self.state.setdefault("leases", {})
+        recovery_state = self.state.setdefault("lease_recovery", {})
+        backend_keys: set[str] = set()
+        due: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for lease in values:
+            node_id = str(lease.get("nodeId") or "")
+            account_id = str(lease.get("accountId") or "")
+            if not node_id or not account_id:
+                continue
+            key = f"{node_id}:{account_id}"
+            backend_keys.add(key)
+            state_leases[key] = lease
+            node = node_by_id.get(node_id)
+            if node is None or not self._is_lease_scoped(node):
+                continue
+            if now >= float(lease.get("cooldownUntil") or 0):
+                retry = recovery_state.get(key) or {}
+                if now >= float(retry.get("next_attempt_at") or 0):
+                    due.append((node, lease))
+        for key in list(state_leases):
+            if key not in backend_keys:
+                state_leases.pop(key, None)
+                recovery_state.pop(key, None)
+        for key in list(recovery_state):
+            if key not in backend_keys:
+                recovery_state.pop(key, None)
+        for node, lease in due[:LEASE_RECOVERY_MAX_PER_CYCLE]:
+            self._recover_lease(node, lease, now)
+        deferred = max(0, len(due) - LEASE_RECOVERY_MAX_PER_CYCLE)
+        if deferred:
+            log_event("lease_recovery_budget_exhausted", due=len(due), deferred=deferred, limit=LEASE_RECOVERY_MAX_PER_CYCLE)
+
+    def _handle_account_degrade(
+        self,
+        all_nodes: list[dict[str, Any]],
+        node: dict[str, Any],
+        audit_value: dict[str, Any],
+        reason: str,
+        now: float,
+    ) -> None:
+        """Account-first response to a missing-thinking sample.
+
+        Three tiers, chosen by what the main service actually supports:
+
+        1. Lease-capable upstream + ``accountBoundProxy`` node: quarantine the
+           one account lease, exactly like upstream. The node is never touched.
+        2. Lease-capable upstream + node-level node: same lease call still
+           scopes the damage to the account, then escalate to the node only if
+           several distinct accounts degrade inside the window.
+        3. Upstream without the lease routes (this guard on an older image):
+           fall back to the admin-API account switch and the same windowed
+           escalation, so a single bad account still never clears an exit.
+
+        Capability is discovered once and cached; a 404/403 from the lease
+        routes downgrades for the rest of the process rather than retrying on
+        every audit.
+        """
+        if not self.config.account_degrade_enabled:
+            return
+        node_id = str(node.get("id") or "")
+        account_id = str(audit_value.get("accountId") or "").strip()
+        lease_scoped = self._is_lease_scoped(node)
+
+        if lease_scoped and not account_id:
+            # Upstream refuses to act without the account identity rather than
+            # guessing, because a node-wide action cannot represent such a node.
+            log_event(
+                "lease_quarantine_suppressed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                reason=reason,
+                cause="missing_account_identity",
+            )
+            return
+
+        if account_id and self._lease_api_available():
+            try:
+                lease = self.api.quarantine_lease(node_id, account_id, reason)
+            except Exception as exc:
+                # Never fail open into a node-wide disable: that is precisely
+                # what account-bound proxy nodes cannot tolerate.
+                self._lease_api_available(force=False, failed=True)
+                log_event(
+                    "lease_quarantine_failed",
+                    node_id=node_id,
+                    node_name=node.get("name"),
+                    account_id=account_id,
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                )
+                return
+            leases = self.state.setdefault("leases", {})
+            key = f"{node_id}:{account_id}"
+            already = key in leases
+            leases[key] = lease
+            self.state.setdefault("lease_recovery", {}).pop(key, None)
+            append_state_event(
+                self.state,
+                "lease_quarantine_extended" if already else "lease_quarantined",
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=account_id,
+                reason=reason,
+                cooldown_until=lease.get("cooldownUntil"),
+            )
+            log_event(
+                "lease_quarantine_extended" if already else "lease_quarantined",
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=account_id,
+                reason=reason,
+                cooldown_until=lease.get("cooldownUntil"),
+            )
+            self._save()
+            if lease_scoped:
+                return
+            # Node-level node on a lease-capable upstream: the lease already
+            # scoped this sample to one account, so do not also disable it via
+            # the admin API. Only the windowed node escalation still applies.
+            lease_applied = True
+        else:
+            lease_applied = False
+            self._force_account_switch(audit_value, reason, now)
+
+        distinct = self._note_node_degrade_account(node_id, account_id, now)
+        threshold = int(self.config.account_degrade_accounts)
+        if distinct < threshold:
+            log_event(
+                "account_degrade_below_threshold",
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=account_id or None,
+                distinct_accounts=distinct,
+                threshold=threshold,
+                reason=reason,
+                **({"status": "deferred_no_admin_api"} if not lease_applied and self._force_account_switch_enabled() and self._admin_credentials_missing() else {}),
+            )
+            return
+        if lease_scoped:
+            # Lease nodes are still not node-disabled; the escalation only
+            # logs so an operator sees a systemic pattern.
+            log_event(
+                "lease_node_degrade_persistent",
+                node_id=node_id,
+                node_name=node.get("name"),
+                distinct_accounts=distinct,
+                threshold=threshold,
+                reason=reason,
+            )
+            return
+        log_event(
+            "node_degrade_confirmed",
+            node_id=node_id,
+            node_name=node.get("name"),
+            distinct_accounts=distinct,
+            threshold=threshold,
+            reason=reason,
+        )
+        self._quarantine(all_nodes, node, reason, now, recover_now=False)
+
     def _track_degraded_account(self, audit_value: dict[str, Any], reason: str, now: float) -> None:
         """Mute an account after repeated real-traffic degradation events."""
         account_id = str(audit_value.get("accountId") or "").strip()
@@ -822,6 +1290,8 @@ class Guard:
         entry["muted_at"] = now
         entry["muted_reason"] = reason
         entry["muted_updated"] = updated
+        entry.pop("forced_switch_until", None)
+        entry.pop("forced_switch_state", None)
         append_state_event(self.state, "account_auto_muted", account_id=account_id, reason=reason, hits=len(hits))
         log_event("account_auto_muted", account_id=account_id, reason=reason, hits=len(hits), updated=updated)
 
@@ -861,14 +1331,24 @@ class Guard:
         if admin is None:
             log_event("account_force_switch_skipped", account_id=account_id, reason=reason, error_type="no_admin_credentials")
             return
+        # Persist the deadline before disabling the account. If the process
+        # dies between the two calls the restart path still knows when to
+        # restore it; the old order left the account disabled with no record,
+        # and a disabled account produces no audits so nothing would retry.
+        entry["forced_switch_until"] = now + hold_seconds
+        entry["forced_switch_reason"] = reason
+        entry["forced_switch_state"] = "pending"
+        self._save()
         try:
             updated = admin.set_accounts_enabled([account_id], False)
         except Exception as exc:
+            entry.pop("forced_switch_until", None)
+            entry.pop("forced_switch_state", None)
+            self._save()
             log_event("account_force_switch_failed", account_id=account_id, reason=reason, error_type=type(exc).__name__)
             return
-        entry["forced_switch_until"] = now + hold_seconds
-        entry["forced_switch_reason"] = reason
         entry["forced_switch_updated"] = updated
+        entry["forced_switch_state"] = "disabled"
         append_state_event(self.state, "account_force_switched", account_id=account_id, reason=reason, hold_seconds=hold_seconds)
         log_event("account_force_switched", account_id=account_id, reason=reason, hold_seconds=hold_seconds, updated=updated)
 
@@ -897,6 +1377,18 @@ class Guard:
             and float(entry.get("forced_switch_until") or 0) > 0
             and float(entry.get("forced_switch_until") or 0) <= now
         ]
+        # A crash between persisting the deadline and calling the admin API can
+        # leave a `pending` entry whose account was never actually disabled.
+        # Clearing it is enough; enabling an account we never touched would
+        # override an operator decision.
+        for account_id, entry in list(accounts.items()):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("forced_switch_state") or "") != "pending":
+                continue
+            entry.pop("forced_switch_until", None)
+            entry.pop("forced_switch_state", None)
+            log_event("account_force_switch_pending_cleared", account_id=account_id)
         if not expired:
             return
         admin = self._admin_client()
@@ -905,6 +1397,7 @@ class Guard:
         for account_id, entry in expired:
             if float(entry.get("muted_at") or 0) > 0:
                 entry.pop("forced_switch_until", None)
+                entry.pop("forced_switch_state", None)
                 continue
             try:
                 updated = admin.set_accounts_enabled([account_id], True)
@@ -912,6 +1405,7 @@ class Guard:
                 log_event("account_force_switch_restore_failed", account_id=account_id, error_type=type(exc).__name__)
                 continue
             entry.pop("forced_switch_until", None)
+            entry.pop("forced_switch_state", None)
             append_state_event(self.state, "account_force_switch_restored", account_id=account_id)
             log_event("account_force_switch_restored", account_id=account_id, updated=updated)
 
@@ -998,6 +1492,24 @@ class Guard:
 
     def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
         node_id = str(node["id"])
+        if self._is_lease_scoped(node):
+            # A node-wide disable cannot represent per-account exits and would
+            # cut every account behind the node. Upstream suppresses here too.
+            self._bump_statistic("actions", "suppressed")
+            append_state_event(
+                self.state,
+                "lease_scoped_quarantine_suppressed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                reason=reason,
+            )
+            log_event(
+                "lease_scoped_quarantine_suppressed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                reason=reason,
+            )
+            return
         if not self.config.quarantine_enabled:
             self._bump_statistic("actions", "suppressed")
             log_event("quarantine_suppressed", node_id=node_id, node_name=node.get("name"), reason=reason, quarantine_enabled=False)
@@ -1013,8 +1525,6 @@ class Guard:
         if source == "passive":
             repeats += 1
         scale = min(8, 2 ** max(0, repeats - 1)) if source == "passive" else 1
-        if reason == "missing_thinking":
-            scale = max(scale, 4)
         state.update({
             "active_soft_strikes": 0,
             "passive_soft_strikes": 0,
@@ -1248,6 +1758,14 @@ class Guard:
         return str(state.get("last_source") or "") == "passive"
 
     def _restore_after_hold(self, node: dict[str, Any], now: float) -> None:
+        """Re-enable a node whose thinking hold expired.
+
+        Unused by the current loops on purpose: every quarantine, including
+        missing_thinking, must pass an authoritative quality probe first
+        (_probe_quarantined -> _recover_quarantined). This helper used to
+        re-enable a node without any probe, which contradicted that rule; it is
+        kept only for callers that already own the decision.
+        """
         node_id = str(node["id"])
         state = self._state_for(node_id)
         updated = self.api.set_enabled(node_id, True)
@@ -1789,6 +2307,11 @@ class Guard:
         if classification == "healthy":
             state["passive_soft_strikes"] = 0
             state["passive_degrade_repeats"] = 0
+            # A healthy sample is also evidence the exit recovered: drop the
+            # degraded-account window so an old burst cannot combine with a
+            # much later one to trip the node.
+            state["degrade_account_samples"] = []
+            state["degrade_account_ids"] = []
             return
         if classification == "soft":
             state["passive_soft_strikes"] = int(state.get("passive_soft_strikes", 0)) + 1
@@ -1817,10 +2340,23 @@ class Guard:
             strikes=int(state.get("passive_soft_strikes", 0)),
         )
         self._track_degraded_account(audit_value, reason, now)
+        if reason == "missing_thinking":
+            # Account symptom, not an egress one. _handle_account_degrade
+            # picks the strongest mechanism available: an account lease when
+            # the main service supports it, otherwise the admin-API account
+            # switch. Running both would disable the account through the admin
+            # API while the lease already scopes it, which is the duplicate
+            # path that made a lease-capable stack depend on admin credentials
+            # it never needed.
+            self._handle_account_degrade(all_nodes, node, audit_value, reason, now)
+            return
+        # Exit-speed anomaly.
         self._force_account_switch(audit_value, reason, now)
-        # User-traffic degrade: isolate immediately and hold until quarantine_seconds.
-        # Do not run the QUALITY_OK recovery probe in the same cycle — that was
-        # restoring nodes a few seconds after a real user burst.
+        # Exit-speed anomaly: the node itself will produce this for every
+        # account behind it, so isolate immediately and hold until
+        # quarantine_seconds. Do not run the QUALITY_OK recovery probe in the
+        # same cycle — that was restoring nodes a few seconds after a real
+        # user burst.
         log_event(
             "passive_immediate_quarantine",
             node_id=node_id,
@@ -1845,6 +2381,10 @@ class Guard:
             if node is None or not node.get("enabled"):
                 continue
             self._record_passive_audit(all_nodes, node, value, now)
+        try:
+            self._reconcile_leases(nodes, now)
+        except Exception as exc:
+            log_event("lease_reconciliation_failed", error_type=type(exc).__name__)
         self._save()
         try:
             self.run_rank_cycle(all_nodes)
@@ -1857,6 +2397,8 @@ class Guard:
 
 
 def acquire_lock(path: Path):
+    if fcntl is None:
+        raise RuntimeError("the quality guard requires a POSIX host for its single-instance lock")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     handle = path.open("a+", encoding="utf-8")
     os.chmod(path, 0o600)
