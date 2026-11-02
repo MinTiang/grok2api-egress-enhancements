@@ -1,9 +1,8 @@
 # Build and publish the Quality Guard sidecar image.
 #
-# Publishes ghcr.io/<owner>/<repo>/quality-guard for linux/amd64 and linux/arm64:
-#   latest      - newest build from the default branch
-#   sha-<short> - pinned build, use this in compose for reproducibility
-#   vX.Y.Z      - when pushed as a git tag
+# Publishes ghcr.io/<owner>/<repo>/quality-guard for linux/amd64 and linux/arm64.
+# Push a v* tag to build; nothing is published from a branch push.
+#   v1.2.3  ->  1.2.3, 1.2, latest, sha-<short>
 #
 # The image is a drop-in for the official tools/egress-quality-guard build, so
 # compose only needs an image reference:
@@ -19,20 +18,19 @@ name: quality-guard image
 
 on:
   push:
-    branches:
-      - main
     tags:
-      - "quality-guard-v*"
       - "v*"
     paths:
       - "sidecar/quality_guard.py"
       - "sidecar/quality_guard_test.py"
+      - "sidecar/preflight.py"
       - "sidecar/Dockerfile"
       - ".github/workflows/quality-guard-image.yml"
   pull_request:
     paths:
       - "sidecar/quality_guard.py"
       - "sidecar/quality_guard_test.py"
+      - "sidecar/preflight.py"
       - "sidecar/Dockerfile"
       - ".github/workflows/quality-guard-image.yml"
   workflow_dispatch:
@@ -78,11 +76,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=match,pattern=v(.*),group=1
-            type=match,pattern=quality-guard-v(.*),group=1
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
       - name: Build and push
         uses: docker/build-push-action@v6
